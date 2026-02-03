@@ -1,0 +1,582 @@
+import pandas as pd
+import influxdb
+from datetime import datetime
+import os
+import sys
+#rom utils import env_loader
+
+# Add the parent directory to Python path (C:\)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+app_dir = os.path.dirname(current_dir)  # Gets the 'app' directory
+project_root = os.path.dirname(app_dir)  # Gets the 'C:\' directory
+sys.path.append(project_root)
+
+# INFLUXDB_HOST = os.getenv('INFLUXDB_HOST')
+# print('INFLUXDB_HOST', INFLUXDB_HOST)
+# INFLUXDB_PORT = os.getenv('INFLUXDB_PORT')
+# INFLUXDB_USERNAME = os.getenv('INFLUXDB_USERNAME')
+# INFLUXDB_PASSWORD = os.getenv('INFLUXDB_PASSWORD')
+# INFLUXDB_DATABASE = os.getenv('INFLUXDB_DATABASE')
+# INFLUXDB_GD_DATABASE = os.getenv('INFLUXDB_GD_DATABASE')
+DURATION = '7d'
+# InfluxDB configurations
+INFLUXDB_HOST = '100.87.234.87'
+MQTT_HOST = '100.87.234.87'
+MQTT_PORT = 1883  # Change if your MQTT broker uses a different port
+MQTT_USERNAME = 'ga_zigbee2mqtt'  # Add your MQTT username if needed
+MQTT_PASSWORD = 'ga_zigbee2mqtt'
+INFLUXDB_PORT = 8086
+INFLUXDB_USERNAME = 'ga_influx_admin'
+INFLUXDB_PASSWORD = '6ae7d195f93434099e9626b30c7c9a37'
+INFLUXDB_DATABASE = 'ga_homeassistant_db'
+INFLUXDB_GD_DATABASE = "gd_data"
+TIMEZONE = 'Europe/Berlin'
+TIMESTAMP_COL = 'time'
+
+# try:
+#     from app.utils.sensors_table import sensors_table
+#     print("✅ Import successful!")
+# except ImportError as e:
+#     print("❌ Import failed:", e)
+#     sys.exit(1)
+
+def sensors_table(INFLUXDB_HOST, INFLUXDB_PORT, INFLUXDB_USER, INFLUXDB_PASSWORD, INFLUXDB_GD_DATABASE):
+
+    # Initialize the InfluxDB client
+    client_influx = influxdb.InfluxDBClient(host=INFLUXDB_HOST,
+                                   port=INFLUXDB_PORT,
+                                   username=INFLUXDB_USER,
+                                   password=INFLUXDB_PASSWORD,
+                                   database=INFLUXDB_GD_DATABASE)
+
+    # Query data from measurement1
+    query1 = 'SELECT "room_id" , "sensor_id", "floor", "device_uuid", "room_type", "sensor_location" FROM "gd_data"."autogen"."sensor_info"'
+    result1 = client_influx.query(query1)
+
+    # Query data from measurement2
+    query2 = 'SELECT "sensor_type", "ieee_address", "device_name" FROM "gd_data"."autogen"."sensor_id"'
+    result2 = client_influx.query(query2)
+
+    # Convert result to a list of dictionaries
+    points1 = list(result1.get_points())
+    points2 = list(result2.get_points())
+
+    # Close the client
+    client_influx.close()
+
+    # Join the two datasets on 'field_common'
+    joined_data = []
+
+    # Create a dictionary for fast lookup of points2 by 'field_common'
+    points2_dict = {point['ieee_address']: point for point in points2}
+
+    # Iterate over points1 and join with points2 based on 'field_common'
+    for point1 in points1:
+        field_common_value = point1['sensor_id'].strip()
+        if field_common_value in points2_dict:
+            point2 = points2_dict[field_common_value]
+            joined_data.append({
+                "sensor_id": field_common_value,
+                "room_id": str(point1['room_id']),
+                "sensor_location": str(point1['sensor_location']),
+                "room_type": point1['room_type'],
+                "floor": str(point1['floor']),
+                "device_uuid": point1['device_uuid'],
+                "sensor_type": point2['sensor_type'],
+                "device_name": str(point2['device_name'])
+            })
+    return joined_data
+    
+def database_exists(client, dbname):
+    existing_databases = client.get_list_database()
+
+    return any(db['name'] == dbname for db in existing_databases)
+
+# Function to connect to the database or create it if it doesn't exist
+def connect_or_create_database(host, port, user, password, dbname):
+    client = influxdb.InfluxDBClient(host, port, user, password)
+    if database_exists(client, dbname):
+        print(f"Database '{dbname}' already exists.")
+    else:
+        client.create_database(dbname)
+        print(f"Database '{dbname}' created successfully.")
+    return influxdb.InfluxDBClient(host, port, user, password, dbname)
+
+def remove_timezone_offset(datetime_str):
+    # Parse the original datetime string with timezone offset
+    dt = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S%z")
+    # Convert to naive datetime (without timezone info)
+    naive_dt = dt.replace(tzinfo=None)
+    # Format back to string without timezone
+    return naive_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_float_convert(value, default=0.0):
+    """Safely convert value to float, handling datetime strings"""
+    if value is None:
+        return float(default)
+    
+    if isinstance(value, (int, float)):
+        return float(value)
+    
+    try:
+        return float(value)
+    except ValueError:
+        pass
+    
+    try:
+        value_clean = value.replace('+0000', '').strip()
+        for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d %H:%M', '%Y-%m-%d']:
+            try:
+                dt = datetime.strptime(value_clean, fmt)
+                return dt.timestamp()
+            except ValueError:
+                continue
+    except (AttributeError, ValueError):
+        pass
+    
+    return float(default)
+
+def clean_and_validate_fields(fields):
+    """
+    Clean and validate fields before saving to InfluxDB.
+    Replace NaN, None, and invalid values with appropriate defaults.
+    """
+    cleaned_fields = {}
+    
+    for key, value in fields.items():
+        # Handle NaN values using only pandas
+        if isinstance(value, (int, float)) and pd.isna(value):
+            cleaned_fields[key] = 0.0
+            
+        # Handle None values
+        elif value is None:
+            if key in ['successful_session']:
+                cleaned_fields[key] = 0
+            else:
+                cleaned_fields[key] = 0.0
+                
+        # Handle string 'nan' values
+        elif isinstance(value, str):
+            try:
+                cleaned_fields[key] = float(value)
+            except:
+                cleaned_fields[key] = value
+
+                
+        # Ensure numeric fields are actually numbers
+        elif isinstance(value, (int, float)):
+            cleaned_fields[key] = float(value)
+            
+        # Handle boolean fields
+        elif key in ['successful_session']:
+            if isinstance(value, bool):
+                cleaned_fields[key] = int(value)
+            elif isinstance(value, (int, float)):
+                cleaned_fields[key] = int(value)
+            else:
+                cleaned_fields[key] = 0
+                
+        # Handle string fields
+        elif isinstance(value, str):
+            # Skip problematic string values that should be numeric
+            if value.lower() in ['nan', 'none', 'null', '']:
+                if key in ['successful_session']:
+                    cleaned_fields[key] = 0
+                else:
+                    cleaned_fields[key] = 0.0
+            else:
+                cleaned_fields[key] = value
+                
+        else:
+            # For any other type, try to convert to appropriate type
+            try:
+                if key in ['successful_session']:
+                    cleaned_fields[key] = int(value)
+                else:
+                    cleaned_fields[key] = float(value)
+            except (ValueError, TypeError):
+                if key in ['successful_session']:
+                    cleaned_fields[key] = 0
+                else:
+                    cleaned_fields[key] = 0.0
+    
+    return cleaned_fields
+
+def safe_float_conversion(value, default=0.0):
+    """Safely convert value to float, handling NaN and None."""
+    try:
+        if value is None or pd.isna(value) or (isinstance(value, str) and value.lower() == 'nan'):
+            return float(default)
+        return float(value)
+    except (ValueError, TypeError):
+        return float(default)
+
+def safe_int_conversion(value, default=0):
+    """Safely convert value to int, handling NaN and None."""
+    try:
+        if value is None or pd.isna(value) or (isinstance(value, str) and value.lower() == 'nan'):
+            return int(default)
+        return int(value)
+    except (ValueError, TypeError):
+        return int(default)
+    
+def time_to_increase_1_degree():
+    """
+    Calculate the exact time needed to increase room temperature by 1 degree Celsius
+    during each heating session and save comprehensive results to InfluxDB,
+    including all existing heating session metrics.
+    """
+    sensor_table = sensors_table(INFLUXDB_HOST, INFLUXDB_PORT, INFLUXDB_USERNAME, INFLUXDB_PASSWORD, INFLUXDB_GD_DATABASE)
+
+    rooms_id = set(sensor['room_id'] for sensor in sensor_table if sensor['room_type'] == 'Active')
+
+    print("Active rooms:", rooms_id)
+    
+    results = {}
+    
+    for room in rooms_id:
+
+        #if room not in ['3', '4', '7', '8']:
+        print(f"Processing room: {room}")
+
+        radiator_id_list = [sensor['sensor_id'] for sensor in sensor_table if sensor['room_id'] == room and sensor['sensor_type'] == "Zigbee thermostatic radiator valve"]
+        
+        temp_sensor_id = [sensor['sensor_id'] for sensor in sensor_table if sensor['room_id'] == room and (sensor['sensor_type'] == "Smart air house keeper" or sensor['sensor_type'] == "Temperature and humidity sensor with screen" or sensor['sensor_type'] == "Temperature and humidity sensor") and sensor['room_type'] == 'Active']
+
+        if not radiator_id_list or not temp_sensor_id:
+            print(f"No radiators or temperature sensors found for room {room}")
+            continue
+
+        client_influx = influxdb.InfluxDBClient(host=INFLUXDB_HOST, port=INFLUXDB_PORT, username=INFLUXDB_USERNAME, password=INFLUXDB_PASSWORD, database=INFLUXDB_GD_DATABASE)
+
+        room_heating_times = []
+        
+        for radiator in radiator_id_list:
+            print(f"Processing radiator: {radiator}")
+            
+            # Query heating sessions for this radiator with all existing fields
+            query_heating_sessions = f'''SELECT * FROM "gd_data"."autogen"."heating_sessions" WHERE time > now() - {DURATION} AND "{room}"=\'{radiator}\' '''
+            heating_sessions = client_influx.query(query_heating_sessions)
+            heating_sessions = pd.DataFrame(heating_sessions.get_points())
+            
+            if heating_sessions.empty:
+                print(f"No heating sessions found for radiator {radiator}")
+                continue
+            
+            # Convert time columns
+            heating_sessions['start_time'] = pd.to_datetime(heating_sessions['start_time'], utc=True)
+            heating_sessions['end_time'] = pd.to_datetime(heating_sessions['end_time'], utc=True)
+            
+            # Get comprehensive room data (temperature and humidity)
+            entity_id_temp = temp_sensor_id[0] + '_temperature'
+            entity_id_humi = temp_sensor_id[0] + '_humidity'
+            
+            # Query temperature data
+            query_room_temp = f'''SELECT mean("value") AS "room_temp" FROM "ga_homeassistant_db"."autogen"."°C" WHERE time > now() - {DURATION} AND "entity_id"=\'{entity_id_temp}\' GROUP BY time(10s) FILL(previous)'''
+            room_temp_data = client_influx.query(query_room_temp)
+            room_temp_data = pd.DataFrame(room_temp_data.get_points())
+            
+            # Query humidity data
+            query_room_humi = f'''SELECT mean("value") AS "room_humi" FROM "ga_homeassistant_db"."autogen"."%" WHERE time > now() - {DURATION} AND "entity_id"=\'{entity_id_humi}\' GROUP BY time(10s) FILL(previous)'''
+            room_humi_data = client_influx.query(query_room_humi)
+            room_humi_data = pd.DataFrame(room_humi_data.get_points())
+            
+            if room_temp_data.empty:
+                print(f"No temperature data found for room {room}")
+                continue
+            
+            # Prepare comprehensive data list
+            room_temp_data['time'] = pd.to_datetime(room_temp_data['time'], utc=True)
+            room_humi_data['time'] = pd.to_datetime(room_humi_data['time'], utc=True)
+            
+            # Merge temperature and humidity data
+            data_list = pd.merge(room_temp_data, room_humi_data, on="time", how="outer")
+            data_list = data_list.sort_values('time')
+            data_list = data_list.round(2)
+            data_list.ffill(inplace=True)
+            data_list.bfill(inplace=True)
+            
+            radiator_results = []
+            influx_data = []
+            
+            # Analyze each heating session
+            for index, session in heating_sessions.iterrows():
+                session_start = session['start_time']
+                session_end = session['end_time']
+                
+                # Filter data for this session
+                session_data = data_list[
+                    (data_list['time'] >= session_start) & 
+                    (data_list['time'] <= session_end)
+                ].copy()
+                
+                if session_data.empty:
+                    continue
+                
+                # Get starting room temperature and humidity
+                start_room_temp = session_data.iloc[0]['room_temp']
+                start_room_humi = session_data.iloc[0]['room_humi']
+                
+                # Find when temperature increased by 1 degree
+                target_temp = start_room_temp + 1.0
+                temp_increase_data = session_data[session_data['room_temp'] >= target_temp]
+                
+                # Calculate overshoot (temperature after heating ends)
+                if heating_sessions['end_time'].dt.tz is not None:
+                    max_timestamp = pd.Timestamp.max.tz_localize(heating_sessions['end_time'].dt.tz)
+                else:
+                    max_timestamp = pd.Timestamp.max
+                
+                # Calculate overshoot for this session
+                heating_end_time = session_end
+                time_window_start = heating_end_time
+                time_window_end = heating_end_time + pd.Timedelta(hours=1)
+                
+                # Get next heating session start time
+                next_sessions = heating_sessions[heating_sessions['start_time'] > session_end]
+                if not next_sessions.empty:
+                    next_heating_start_time = next_sessions.iloc[0]['start_time']
+                else:
+                    next_heating_start_time = max_timestamp
+                
+                # Filter data for overshoot calculation
+                overshoot_data = data_list[
+                    (data_list['time'] > time_window_start) & 
+                    (data_list['time'] <= time_window_end) &
+                    (data_list['time'] < next_heating_start_time)
+                ]
+                
+                # Find maximum temperature in overshoot window
+                if not overshoot_data.empty:
+                    overshoot_temperature = overshoot_data['room_temp'].max()
+                else:
+                    overshoot_temperature = None
+                
+                # Get ending room temperature and humidity
+                final_room_temp = session_data.iloc[-1]['room_temp']
+                final_room_humi = session_data.iloc[-1]['room_humi']
+                
+                # Calculate room temperature metrics
+                delta_room_degrees = final_room_temp - start_room_temp
+                duration_hours = (session_end - session_start).total_seconds() / 3600
+                room_heating_rate = delta_room_degrees / duration_hours if duration_hours > 0 else 0
+                
+                if not temp_increase_data.empty:
+                    # Successful session - temperature increased by 1 degree
+                    first_1_degree_time = temp_increase_data.iloc[0]['time']
+                    time_to_1_degree = (first_1_degree_time - session_start).total_seconds() / 3600
+                    
+                    session_result = {
+                        'session_start': session_start,
+                        'session_end': session_end,
+                        'time_1_degree_reached': first_1_degree_time,
+                        'time_to_1_degree_hours': round(time_to_1_degree, 2),
+                        'heating_efficiency': round(1.0 / time_to_1_degree, 2) if time_to_1_degree > 0 else 0,
+                        'successful_session': 1
+                    }
+                    
+                    radiator_results.append(session_result)
+                    
+                    print(f"Session {session_start}: {time_to_1_degree:.2f} hours to +1°C "
+                        f"({start_room_temp:.1f}°C → {target_temp:.1f}°C)")
+                
+                else:
+                    # Unsuccessful session - temperature didn't increase by 1 degree
+                    max_room_temp = session_data['room_temp'].max()
+                    session_result = {
+                        'session_start': session_start,
+                        'session_end': session_end,
+                        'max_temperature_reached': round(max_room_temp, 2),
+                        'successful_session': 0
+                    }
+                    
+                    print(f"Session {session_start}: Temperature did not increase by 1°C "
+                        f"(start: {start_room_temp:.1f}°C, max: {max_room_temp:.1f}°C)")
+                
+                #print('hihi', session)
+                # Prepare comprehensive data for InfluxDB with ALL existing fields
+                fields = {
+                    # Existing heating session metrics - with safe conversion
+                    'average_valve_opening': safe_float_conversion(session.get('average_valve_opening')),
+                    'duration': safe_float_conversion(session.get('duration')),
+                    'end_initial_phase_calibration': safe_float_conversion(session.get('end_initial_phase_calibration')),
+                    'end_initial_phase_radiator_temperature': safe_float_conversion(session.get('end_initial_phase_radiator_temperature')),
+                    'end_initial_phase_temperature': safe_float_conversion(session.get('end_initial_phase_temperature')),
+                    'end_of_initial_phase': safe_float_conversion(session.get('end_of_initial_phase')),
+                    'end_radiator_temperature': safe_float_conversion(session.get('end_radiator_temperature')),
+                    'end_setpoint': safe_float_conversion(session.get('end_setpoint')),
+                    'end_temperature': safe_float_conversion(session.get('end_temperature')),
+                    'end_temperature_calibration': safe_float_conversion(session.get('end_temperature_calibration')),
+                    'heating_rate_initial_phase': safe_float_conversion(session.get('heating_rate_initial_phase')),
+                    'initial_phase_average_valve_opening': safe_float_conversion(session.get('initial_phase_average_valve_opening')),
+                    'initial_phase_radiator_heating_rate': safe_float_conversion(session.get('initial_phase_radiator_heating_rate')),
+                    'previous_state_duration': safe_float_conversion(session.get('previous_state_duration')),
+                    'radiator_heating_rate': safe_float_conversion(session.get('radiator_heating_rate')),
+                    'start_radiator_temperature': safe_float_conversion(session.get('start_radiator_temperature')),
+                    'start_setpoint': safe_float_conversion(session.get('start_setpoint')),
+                    'start_temperature': safe_float_conversion(session.get('start_temperature')),
+                    'start_temperature_calibration': safe_float_conversion(session.get('start_temperature_calibration')),
+                    
+                    # New room temperature metrics
+                    'start_room_temperature': safe_float_conversion(start_room_temp),
+                    'start_room_humidity': safe_float_conversion(start_room_humi),
+                    'final_room_temperature': safe_float_conversion(final_room_temp),
+                    'final_room_humidity': safe_float_conversion(final_room_humi),
+                    'delta_room_degrees': safe_float_conversion(delta_room_degrees),
+                    'room_heating_rate': safe_float_conversion(room_heating_rate),
+                    'overshoot_temperature': safe_float_conversion(overshoot_temperature),
+                    'successful_session': safe_int_conversion(session_result['successful_session']),
+                    
+                    # Time to 1 degree metrics
+                    'time_to_1_degree_hours': float(session_result.get('time_to_1_degree_hours', 0) or 0),
+                    'heating_efficiency': float(session_result.get('heating_efficiency', 0) or 0)
+                }
+
+                # Add conditional fields
+                if session_result['successful_session'] != 1:
+                    # Skip this entire row/session
+                    continue 
+                fields['target_temperature'] = safe_float_conversion(target_temp)
+
+                # Clean all fields before saving
+                cleaned_fields = clean_and_validate_fields(fields)
+
+                print('cleaned fields:', cleaned_fields)
+
+                # Remove any remaining None values
+                cleaned_fields = {k: v for k, v in cleaned_fields.items() if v is not None}
+
+                print('final cleaned fields:', cleaned_fields)
+
+                influx_data.append({
+                    "measurement": "heating_analysis",
+                    "tags": {
+                        'room': room,
+                        'radiator': radiator,
+                        'temperature_sensor': temp_sensor_id[0],
+                        'session_type': str(session.get('session_type', 'unknown'))
+                    },
+                    "time": session_start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                    "fields": cleaned_fields
+                })
+            
+            print('influx data prepared:', len(influx_data), 'entries', influx_data[:10])
+            # Save comprehensive data to InfluxDB for this radiator
+            if influx_data:
+                try:
+                    client = connect_or_create_database(INFLUXDB_HOST, INFLUXDB_PORT,
+                                                    INFLUXDB_USERNAME, INFLUXDB_PASSWORD,
+                                                    INFLUXDB_GD_DATABASE)
+                    
+                    # Write data to InfluxDB
+                    client.write_points(influx_data)
+                    print(f"Saved {len(influx_data)} comprehensive sessions to InfluxDB for radiator {radiator}")
+                    
+                    # Close the connection
+                    client.close()
+                    
+                except Exception as e:
+                    print(f"Error saving to InfluxDB for radiator {radiator}: {e}")
+            
+            # Calculate statistics for this radiator
+            if radiator_results:
+                valid_sessions = [r for r in radiator_results if r.get('time_to_1_degree_hours', 0) > 0]
+                
+                if valid_sessions:
+                    times_to_1_degree = [session['time_to_1_degree_hours'] for session in valid_sessions]
+                    
+                    radiator_summary = {
+                        'radiator_id': radiator,
+                        'avg_time_to_1_degree_hours': round(sum(times_to_1_degree) / len(times_to_1_degree), 2),
+                        'median_time_to_1_degree_hours': round(pd.Series(times_to_1_degree).median(), 2),
+                        'min_time_to_1_degree_hours': round(min(times_to_1_degree), 2),
+                        'max_time_to_1_degree_hours': round(max(times_to_1_degree), 2),
+                        'successful_sessions': len(valid_sessions),
+                        'total_sessions_analyzed': len(radiator_results),
+                        'success_rate': round(len(valid_sessions) / len(radiator_results) * 100, 1),
+                        'session_details': radiator_results
+                    }
+                    
+                    room_heating_times.append(radiator_summary)
+                    print(f"Radiator {radiator}: {radiator_summary['avg_time_to_1_degree_hours']:.2f} hours to +1°C "
+                        f"({radiator_summary['successful_sessions']}/{radiator_summary['total_sessions_analyzed']} sessions)")
+        
+        # Save room-level summary to InfluxDB
+        if room_heating_times:
+            all_times = [radiator['avg_time_to_1_degree_hours'] for radiator in room_heating_times]
+            room_avg_time = sum(all_times) / len(all_times)
+            total_successful_sessions = sum(radiator['successful_sessions'] for radiator in room_heating_times)
+            total_analyzed_sessions = sum(radiator['total_sessions_analyzed'] for radiator in room_heating_times)
+            
+            results[room] = {
+                'average_time_to_1_degree_hours': round(room_avg_time, 2),
+                'total_successful_sessions': total_successful_sessions,
+                'total_analyzed_sessions': total_analyzed_sessions,
+                'overall_success_rate': round(total_successful_sessions / total_analyzed_sessions * 100, 1),
+                'radiators': room_heating_times
+            }
+            
+            # Save room summary to InfluxDB
+            room_summary_data = [{
+                "measurement": "thu_summary",
+                "tags": {
+                    'room': room
+                },
+                "time": pd.Timestamp.now(tz='UTC').strftime('%Y-%m-%dT%H:%M:%SZ'),
+                "fields": {
+                    'avg_time_to_1_degree_hours': round(room_avg_time, 2),
+                    'total_successful_sessions': total_successful_sessions,
+                    'total_analyzed_sessions': total_analyzed_sessions,
+                    'success_rate_percent': round(total_successful_sessions / total_analyzed_sessions * 100, 1),
+                    'number_of_radiators': len(room_heating_times)
+                }
+            }]
+            
+            try:
+                client = connect_or_create_database(INFLUXDB_HOST, INFLUXDB_PORT,
+                                                INFLUXDB_USERNAME, INFLUXDB_PASSWORD,
+                                                INFLUXDB_GD_DATABASE)
+                
+                client.write_points(room_summary_data)
+                print(f"Saved room summary to InfluxDB for room {room}")
+                
+                client.close()
+                
+            except Exception as e:
+                print(f"Error saving room summary to InfluxDB for room {room}: {e}")
+            
+            print(f"Room {room} summary: {room_avg_time:.2f} hours to increase by 1°C "
+                f"({total_successful_sessions}/{total_analyzed_sessions} successful sessions)")
+        
+        client_influx.close()
+        #else: continue
+
+    return results
+
+# Example 1: Run the analysis and save to InfluxDB
+def heating_rate():
+    print("Starting comprehensive heating analysis...")
+    
+    # Run the analysis - this automatically saves to InfluxDB
+    results = time_to_increase_1_degree()
+    
+    print("\n=== ANALYSIS COMPLETE ===")
+
+    if results: 
+        for room, data in results.items():
+            print(f"\nRoom: {room}")
+            print(f"  Average time to +1°C: {data['average_time_to_1_degree_hours']} hours")
+            print(f"  Success rate: {data['overall_success_rate']}%")
+            print(f"  Sessions analyzed: {data['total_analyzed_sessions']}")
+            print(f"  Successful sessions: {data['total_successful_sessions']}")
+            
+            # Show radiator details
+            for radiator in data['radiators']:
+                print(f"    Radiator: {radiator['radiator_id']}")
+                print(f"      Avg time: {radiator['avg_time_to_1_degree_hours']} hours")
+                print(f"      Success rate: {radiator['success_rate']}%")
+
+    else: 
+        print("No results to display.")
+
+heating_rate()

@@ -1,0 +1,503 @@
+import paho.mqtt.client as mqtt
+import json
+import time
+from typing import Dict, List, Tuple
+import influxdb
+import logging
+from dotenv import load_dotenv
+import os
+import sys
+import threading
+#from utils import env_loader
+from datetime import datetime
+
+# Add the parent directory to Python path (C:\)
+current_dir = os.path.dirname(os.path.abspath(__file__))
+app_dir = os.path.dirname(current_dir)
+project_root = os.path.dirname(app_dir)
+sys.path.append(project_root)
+
+# try:
+#     from app.utils.sensors_table import sensors_table
+#     print("✅ Import successful!")
+# except ImportError as e:
+#     print("❌ Import failed:", e)
+#     sys.exit(1)
+
+INFLUXDB_HOST = '100.87.234.87'
+MQTT_HOST = '100.87.234.87'
+MQTT_PORT = 1883  # Change if your MQTT broker uses a different port
+MQTT_USERNAME = 'ga_zigbee2mqtt'  # Add your MQTT username if needed
+MQTT_PASSWORD = 'ga_zigbee2mqtt'
+INFLUXDB_PORT = 8086
+INFLUXDB_USERNAME = 'ga_influx_admin'
+INFLUXDB_PASSWORD = '6ae7d195f93434099e9626b30c7c9a37'
+INFLUXDB_DATABASE = 'ga_homeassistant_db'
+INFLUXDB_GD_DATABASE = "gd_data"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+def database_exists(client, dbname):
+    existing_databases = client.get_list_database()
+    return any(db['name'] == dbname for db in existing_databases)
+
+def connect_or_create_database(host, port, user, password, dbname):
+    client = influxdb.InfluxDBClient(host, port, user, password)
+    if database_exists(client, dbname):
+        print(f"Database '{dbname}' already exists.")
+    else:
+        client.create_database(dbname)
+        print(f"Database '{dbname}' created successfully.")
+    return influxdb.InfluxDBClient(host, port, user, password, dbname)
+
+def sensors_table(INFLUXDB_HOST, INFLUXDB_PORT, INFLUXDB_USER, INFLUXDB_PASSWORD, INFLUXDB_GD_DATABASE):
+    try:
+        client_influx = connect_or_create_database(INFLUXDB_HOST, INFLUXDB_PORT, INFLUXDB_USER, INFLUXDB_PASSWORD, INFLUXDB_GD_DATABASE)
+
+        query1 = 'SELECT "room_id" , "sensor_id", "floor", "device_uuid", "room_type", "sensor_location" FROM "gd_data"."autogen"."sensor_info"'
+        result1 = client_influx.query(query1)
+
+        query2 = 'SELECT "sensor_type", "ieee_address", "device_name" FROM "gd_data"."autogen"."sensor_id"'
+        result2 = client_influx.query(query2)
+
+        points1 = list(result1.get_points())
+        points2 = list(result2.get_points())
+
+        client_influx.close()
+
+        joined_data = []
+        points2_dict = {point['ieee_address']: point for point in points2}
+
+        for point1 in points1:
+            field_common_value = point1['sensor_id'].strip()
+            if field_common_value in points2_dict:
+                point2 = points2_dict[field_common_value]
+                joined_data.append({
+                    "sensor_id": field_common_value,
+                    "room_id": str(point1['room_id']),
+                    "sensor_location": str(point1['sensor_location']),
+                    "room_type": point1['room_type'],
+                    "floor": str(point1['floor']),
+                    "device_uuid": point1['device_uuid'],
+                    "sensor_type": point2['sensor_type'],
+                    "device_name": str(point2['device_name'])
+                })
+
+        logger.info(f"✅ Successfully loaded {len(joined_data)} sensors from InfluxDB")
+        return joined_data
+    except Exception as e:
+        logger.error(f"❌ Error loading sensor table: {e}")
+        raise
+
+class MultiTRVSyncMonitor:
+    def __init__(self, host, port, username, password):
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        sensor_table = sensors_table(INFLUXDB_HOST, INFLUXDB_PORT, INFLUXDB_USERNAME, INFLUXDB_PASSWORD, INFLUXDB_GD_DATABASE)
+        self.sensor_table = sensor_table
+        self.client = None
+        self.connected = False
+        self.reconnect_delay = 5
+        self.max_reconnect_delay = 300
+        self.last_modes = {}
+        self.last_temps = {}  # Store DISPLAY temperatures (already divided by 100)
+        self.last_print_time = {}
+        
+        # FIX: Track pending verifications to avoid processing same change twice
+        self.pending_verifications = {}  # {device_id: set of pending change keys}
+        self.synced_changes = {}  # Track what we've already synced
+        self.sync_window = 8.0
+        
+        # Track sync attempts and failures for verification
+        self.sync_failures = {}  # {device_id: failure_count}
+        self.max_retry_attempts = 3
+        self.verification_timeout = 3.0  # seconds to wait for verification
+        
+        # Build room groups from sensor table
+        self.room_groups = self._build_room_groups(sensor_table)
+
+        self.device_to_room = {}
+        for room, devices in self.room_groups.items():
+            for device in devices:
+                self.device_to_room[device] = room
+
+        logger.info("🎯 Multi-TRV Sync Monitor initialized")
+        logger.info(f"📍 Monitoring {len(self.room_groups)} rooms")
+        for room, devices in self.room_groups.items():
+            if len(devices) > 1:
+                logger.info(f" {room}: {len(devices)} TRVs")
+        self._connect()
+
+    def _connect(self):
+        """Connect to MQTT broker with error handling"""
+        try:
+            if self.client is not None:
+                try:
+                    self.client.disconnect()
+                except:
+                    pass
+            self.client = mqtt.Client()
+            self.client.username_pw_set(self.username, self.password)
+            self.client.on_connect = self.on_connect
+            self.client.on_message = self.on_message
+            self.client.on_disconnect = self.on_disconnect
+            logger.info(f"🔌 Attempting to connect to MQTT broker at {self.host}:{self.port}...")
+            self.client.connect(self.host, self.port, 60)
+            self.client.loop_start()
+            self.connected = True
+            self.reconnect_delay = 5
+        except Exception as e:
+            logger.error(f"❌ Failed to connect to MQTT: {e}")
+            self.connected = False
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self):
+        """Schedule reconnection attempt"""
+        logger.warning(f"⏳ Will retry connection in {self.reconnect_delay} seconds...")
+        time.sleep(self.reconnect_delay)
+        self.reconnect_delay = min(self.reconnect_delay * 1.5, self.max_reconnect_delay)
+        self._connect()
+
+    def _build_room_groups(self, sensor_table) -> Dict[str, List[str]]:
+        """Build room groups from sensor table"""
+        room_groups = {}
+        rooms_id = set(sensor['room_id'] for sensor in sensor_table if sensor['room_id'] != 'OUT')
+        for room in rooms_id:
+            radiators_id_list = [sensor['sensor_id'] for sensor in sensor_table
+                                if sensor['room_id'] == room and sensor['sensor_type'] == "Zigbee thermostatic radiator valve"]
+            if len(radiators_id_list) > 1:
+                room_groups[room] = radiators_id_list
+        return room_groups
+
+    def on_connect(self, client, userdata, flags, rc):
+        """Handle MQTT connection"""
+        if rc == 0:
+            logger.info("✅ Connected to MQTT broker")
+            client.subscribe("zigbee2mqtt/+/#")
+            self.connected = True
+        else:
+            logger.error(f"❌ Connection failed with code {rc}")
+            self.connected = False
+
+    def on_disconnect(self, client, userdata, rc):
+        """Handle MQTT disconnection"""
+        self.connected = False
+        if rc != 0:
+            logger.warning(f"⚠️ Unexpected MQTT disconnection (code {rc})")
+            self._schedule_reconnect()
+
+    def get_device_name(self, topic):
+        """Extract device name from topic like 'zigbee2mqtt/0x7cc6b6fffe0bd910/...'"""
+        try:
+            return topic.split('/')[1]
+        except IndexError:
+            logger.error(f"Invalid topic format: {topic}")
+            return None
+
+    def publish_to_device(self, device_id, command: Dict):
+        """Publish command to device via MQTT with QoS=1 (at least once delivery)"""
+        try:
+            if not self.connected:
+                logger.warning(f"⚠️ Not connected to MQTT, skipping publish to {device_id}")
+                return False
+            topic = f"zigbee2mqtt/{device_id}/set"
+            payload = json.dumps(command)
+            # QoS=1 ensures at-least-once delivery
+            result = self.client.publish(topic, payload, qos=1)
+            if result.rc == mqtt.MQTT_ERR_SUCCESS:
+                logger.info(f" ➡️ Publishing to {device_id}: {payload}")
+                return True
+            else:
+                logger.error(f"❌ Failed to publish to {device_id}: error code {result.rc}")
+                return False
+        except Exception as e:
+            logger.error(f"❌ Error publishing to device: {e}")
+            return False
+
+    def _get_change_key(self, room: str, new_mode: str = None, new_temp_raw: float = None) -> str:
+        """Create a unique key for a change to prevent duplicate syncs"""
+        return f"{room}_{new_mode}_{new_temp_raw}"
+
+    def on_message(self, client, userdata, msg):
+        """Handle incoming MQTT messages"""
+        try:
+            payload = msg.payload.decode()
+            if payload.replace('.', '').replace('-', '').isdigit():
+                return
+            data = json.loads(payload)
+            if not isinstance(data, dict):
+                return
+            if not any(field in data for field in ['system_mode', 'occupied_heating_setpoint']):
+                return
+
+            device_id = self.get_device_name(msg.topic)
+            if not device_id or device_id not in self.device_to_room:
+                return
+
+            room = self.device_to_room[device_id]
+
+            # FIX: Always update device state, even if we're currently syncing
+            # This is important for mode changes which can arrive during temp sync
+
+            # Extract values
+            new_mode = data.get('system_mode')
+            new_temp_raw = data.get('occupied_heating_setpoint')
+
+            # Store display temperature (divided by 100)
+            if new_temp_raw is not None:
+                new_temp_display = new_temp_raw / 100.0
+            else:
+                new_temp_display = None
+
+            if new_mode and (new_mode == {} or not isinstance(new_mode, str)):
+                return
+
+            old_mode = self.last_modes.get(device_id)
+            old_temp = self.last_temps.get(device_id)
+            current_time = time.time()
+
+            mode_changed = (old_mode != new_mode) and new_mode is not None
+            temp_changed = (old_temp != new_temp_display) and new_temp_display is not None
+
+            last_print = self.last_print_time.get(device_id, 0)
+            recently_printed = (current_time - last_print) < 3.0
+
+            if (mode_changed or temp_changed) and not recently_printed:
+                if new_mode is not None:
+                    self.last_modes[device_id] = new_mode
+                if new_temp_display is not None:
+                    self.last_temps[device_id] = new_temp_display
+                self.last_print_time[device_id] = current_time
+
+                logger.info(f"🔄 {room.upper()} - {device_id}")
+                if mode_changed:
+                    logger.info(f" Mode: {old_mode or 'Unknown'} → {new_mode}")
+                if temp_changed:
+                    logger.info(f" Temperature: {old_temp or 'Unknown'} → {new_temp_display}°C")
+                logger.info(f" Time: {time.strftime('%H:%M:%S')}")
+
+                self.sync_to_peers(device_id, room, mode_changed, temp_changed, new_mode, new_temp_raw)
+                logger.info(" " + "─" * 40)
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError, TypeError) as e:
+            logger.debug(f"Error processing message: {e}")
+        except Exception as e:
+            logger.error(f"❌ Unexpected error in on_message: {e}")
+
+    def sync_to_peers(self, source_device, room, mode_changed=False, temp_changed=False, new_mode=None, new_temp_raw=None):
+        """Sync changes to other devices in the same room with verification"""
+        try:
+            peer_devices = [d for d in self.room_groups[room] if d != source_device]
+            if not peer_devices:
+                return
+
+            change_key = self._get_change_key(room, new_mode, new_temp_raw)
+            current_time = time.time()
+
+            if change_key in self.synced_changes:
+                last_sync_time = self.synced_changes[change_key]
+                time_since_sync = current_time - last_sync_time
+                if time_since_sync < self.sync_window:
+                    logger.debug(f" ⏭️ Skipping re-sync of {room}: {time_since_sync:.2f}s ago")
+                    return
+
+            self.synced_changes[change_key] = current_time
+
+            old_keys = [k for k, t in self.synced_changes.items() if (current_time - t) > self.sync_window]
+            for k in old_keys:
+                del self.synced_changes[k]
+
+            # Sync to all peers
+            for peer in peer_devices:
+                command = {}
+                if mode_changed and new_mode is not None:
+                    command['system_mode'] = new_mode
+                if temp_changed and new_temp_raw is not None:
+                    command['occupied_heating_setpoint'] = new_temp_raw
+                if command:
+                    # Publish and then verify in background
+                    if self.publish_to_device(peer, command):
+                        logger.info(f" 🔗 Syncing {room}: {source_device} → {peer}")
+                        
+                        # Pass the display temperature for comparison
+                        expected_temp_display = new_temp_raw / 100.0 if new_temp_raw else None
+                        self._verify_sync_async(peer, room, source_device, command, new_mode, expected_temp_display)
+                    else:
+                        logger.error(f" ❌ Failed to publish sync command to {peer}")
+                        self._log_sync_attempt(source_device, peer, room, False, command, "publish_failed")
+
+        except Exception as e:
+            logger.error(f"❌ Error in sync_to_peers: {e}")
+
+    def _verify_sync_async(self, device_id, room, source_device, command, expected_mode, expected_temp_display):
+        """Verify sync was successful in a background thread"""
+        def check_state():
+            start_time = time.time()
+            verified = False
+            
+            while time.time() - start_time < self.verification_timeout:
+                # Check if this device's state matches what we commanded
+                current_mode = self.last_modes.get(device_id)
+                current_temp = self.last_temps.get(device_id)
+                
+                # Compare display temperatures directly (both already divided by 100)
+                mode_matches = (expected_mode is None) or (current_mode == expected_mode)
+                temp_matches = (expected_temp_display is None) or (current_temp == expected_temp_display)
+                
+                if mode_matches and temp_matches:
+                    logger.info(f" ✅ Verified sync to {device_id}: Mode={current_mode}, Temp={current_temp}°C")
+                    verified = True
+                    # Reset failure counter on success
+                    if device_id in self.sync_failures:
+                        self.sync_failures[device_id] = 0
+                    self._log_sync_attempt(source_device, device_id, room, True, command, "verified")
+                    break
+                
+                time.sleep(0.3)
+            
+            # Verification failed - log and retry
+            if not verified:
+                logger.warning(f" ⚠️ Sync verification FAILED for {device_id} in {room}")
+                logger.warning(f"    Expected: Mode={expected_mode}, Temp={expected_temp_display}°C")
+                logger.warning(f"    Got: Mode={self.last_modes.get(device_id)}, Temp={self.last_temps.get(device_id)}°C")
+                
+                self._log_sync_attempt(source_device, device_id, room, False, command, "verification_failed")
+                self._retry_sync(device_id, room, source_device, command, expected_mode, expected_temp_display, attempt=1)
+        
+        # Run verification in background thread
+        verification_thread = threading.Thread(target=check_state, daemon=True)
+        verification_thread.start()
+
+    def _retry_sync(self, device_id, room, source_device, command, expected_mode, expected_temp_display, attempt=1):
+        """Retry syncing to a device if verification fails"""
+        if attempt > self.max_retry_attempts:
+            logger.error(f" ❌ Max retries ({self.max_retry_attempts}) exceeded for {device_id}")
+            # Track failure count
+            self.sync_failures[device_id] = self.sync_failures.get(device_id, 0) + 1
+            self._log_sync_attempt(source_device, device_id, room, False, command, "max_retries_exceeded")
+            
+            # Send alert if too many failures
+            if self.sync_failures[device_id] >= 3:
+                self._send_failure_alert(device_id, room, self.sync_failures[device_id])
+            return
+        
+        def retry_logic():
+            logger.info(f" 🔄 Retry attempt {attempt}/{self.max_retry_attempts} for {device_id}")
+            time.sleep(1)  # Wait before retry
+            
+            if self.publish_to_device(device_id, command):
+                time.sleep(0.5)  # Wait for state update
+                self._verify_sync_async(device_id, room, source_device, command, expected_mode, expected_temp_display)
+            else:
+                # If publish fails, schedule next retry
+                self._retry_sync(device_id, room, source_device, command, expected_mode, expected_temp_display, attempt + 1)
+        
+        retry_thread = threading.Thread(target=retry_logic, daemon=True)
+        retry_thread.start()
+
+    def _log_sync_attempt(self, source_device, peer_device, room, success, command, status):
+        """Log sync attempts to InfluxDB for monitoring and debugging"""
+        try:
+            client = influxdb.InfluxDBClient(
+                INFLUXDB_HOST, 
+                int(INFLUXDB_PORT), 
+                INFLUXDB_USERNAME, 
+                INFLUXDB_PASSWORD, 
+                INFLUXDB_DATABASE
+            )
+            
+            point = {
+                "measurement": "trv_sync_attempt",
+                "tags": {
+                    "source_device": source_device,
+                    "peer_device": peer_device,
+                    "room": room,
+                    "status": status,
+                    "success": "true" if success else "false"
+                },
+                "fields": {
+                    "command": json.dumps(command),
+                    "timestamp": int(time.time() * 1000)
+                },
+                "time": int(time.time() * 1e9)
+            }
+            
+            client.write_points([point])
+            client.close()
+            logger.debug(f"📊 Logged sync attempt to InfluxDB: {source_device} → {peer_device} ({status})")
+        except Exception as e:
+            logger.error(f"❌ Failed to log sync attempt to InfluxDB: {e}")
+
+    def _send_failure_alert(self, device_id, room, failure_count):
+        """Send alert when a device fails to sync multiple times"""
+        alert_message = f"⚠️ ALERT: Device {device_id} in {room} has failed to sync {failure_count} times. Check device status!"
+        logger.error(alert_message)
+        
+        # Log alert to InfluxDB for monitoring dashboards
+        try:
+            client = influxdb.InfluxDBClient(
+                INFLUXDB_HOST, 
+                int(INFLUXDB_PORT), 
+                INFLUXDB_USERNAME, 
+                INFLUXDB_PASSWORD, 
+                INFLUXDB_DATABASE
+            )
+            
+            alert_point = {
+                "measurement": "trv_sync_alert",
+                "tags": {
+                    "device_id": device_id,
+                    "room": room,
+                    "alert_type": "repeated_sync_failure"
+                },
+                "fields": {
+                    "failure_count": failure_count,
+                    "message": alert_message
+                },
+                "time": int(time.time() * 1e9)
+            }
+            
+            client.write_points([alert_point])
+            client.close()
+            logger.info(f"📊 Logged alert to InfluxDB")
+        except Exception as e:
+            logger.error(f"❌ Failed to log alert to InfluxDB: {e}")
+
+    def get_sync_status(self):
+        """Get current sync status for monitoring"""
+        return {
+            "synced_changes": dict(self.synced_changes),
+            "sync_failures": dict(self.sync_failures),
+            "timestamp": datetime.now().isoformat()
+        }
+
+    def reset_failure_counters(self):
+        """Reset failure counters for a device"""
+        self.sync_failures.clear()
+        logger.info("🔄 Failure counters reset")
+
+
+if __name__ == "__main__":
+    load_dotenv()
+    
+    monitor = MultiTRVSyncMonitor(
+        host=MQTT_HOST,
+        port=MQTT_PORT,
+        username=MQTT_USERNAME,
+        password=MQTT_PASSWORD
+    )
+    
+    try:
+        # Keep the monitor running
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        logger.info("🛑 Shutting down Multi-TRV Sync Monitor")
+        if monitor.client:
+            monitor.client.loop_stop()
+            monitor.client.disconnect()
